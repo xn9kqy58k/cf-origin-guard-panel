@@ -1,2 +1,7 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Force shell files to keep Unix line endings on GitHub and VPS clones.
+*.sh text eol=lf
+bin/* text eol=lf
+systemd/* text eol=lf
+examples/* text eol=lf
+*.md text eol=lf
+*.txt text eol=lf

@@ -177,10 +177,15 @@ EOF_CRON
 main() {
   need_root
 
-  if [[ ! -x "${REPO_DIR}/bin/cf-origin-guard" ]]; then
+  if [[ ! -f "${REPO_DIR}/bin/cf-origin-guard" ]]; then
     echo "ERROR: ${REPO_DIR}/bin/cf-origin-guard not found" >&2
     exit 1
   fi
+  if [[ ! -f "${REPO_DIR}/bin/cf" ]]; then
+    echo "ERROR: ${REPO_DIR}/bin/cf not found" >&2
+    exit 1
+  fi
+  chmod +x "${REPO_DIR}/bin/cf-origin-guard" "${REPO_DIR}/bin/cf" 2>/dev/null || true
 
   install_dependencies
   install_binaries
