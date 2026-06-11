@@ -53,7 +53,7 @@ Cloudflare 官方 IPv6 段
 ## 安装
 
 ```bash
-git clone https://github.com/你的用户名/cf-origin-guard-panel.git
+git clone https://github.com/xn9kqy58k/cf-origin-guard-panel.git
 cd cf-origin-guard-panel
 bash install.sh
 ```
