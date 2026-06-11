@@ -1,0 +1,13 @@
+[Unit]
+Description=Cloudflare Origin Guard firewall rules
+Documentation=https://www.cloudflare.com/ips/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cf-origin-guard apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

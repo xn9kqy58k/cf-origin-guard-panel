@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Convenience entrypoint. Type `cf` to open the visual panel.
+if [[ $# -eq 0 ]]; then
+  exec /usr/local/sbin/cf-origin-guard menu
+fi
+exec /usr/local/sbin/cf-origin-guard "$@"

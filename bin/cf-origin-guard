@@ -1,0 +1,1183 @@
+#!/usr/bin/env bash
+# cf-origin-guard
+# Terminal visual panel + firewall guard for restricting origin web ports to Cloudflare IP ranges.
+
+set -Eeuo pipefail
+
+PROGRAM="cf-origin-guard"
+VERSION="2.0.0"
+CONFIG_FILE="${CFOG_CONFIG:-/etc/cf-origin-guard/cf-origin-guard.conf}"
+CONFIG_DIR="$(dirname "$CONFIG_FILE")"
+
+# Defaults. /etc/cf-origin-guard/cf-origin-guard.conf may override these.
+ENABLE_GUARD="0"                   # 1 = enforce Cloudflare-only origin access; 0 = disabled
+ENABLE_AUTO_SYNC="1"               # 1 = systemd timer/cron enabled; 0 = disabled
+WEB_PORTS="80,443"                 # comma-separated TCP ports restricted to Cloudflare source IP ranges
+ENABLE_IPV6="auto"                 # auto | 1 | 0
+DROP_ACTION="DROP"                 # DROP | REJECT
+ALLOW_LOOPBACK="1"                 # 1 | 0
+MANAGE_NGINX_REALIP="0"            # 1 | 0. Default off to avoid touching existing Nginx behavior.
+NGINX_REALIP_CONF="auto"           # auto | absolute path
+NGINX_REALIP_STRICT="0"            # 1 = fail apply when nginx real_ip update fails
+CF_IPV4_URL="https://www.cloudflare.com/ips-v4"
+CF_IPV6_URL="https://www.cloudflare.com/ips-v6"
+CURL_CONNECT_TIMEOUT="10"
+CURL_MAX_TIME="45"
+CURL_RETRIES="3"
+LOG_FILE="/var/log/cf-origin-guard.log"
+EXTRA_ALLOWLIST_IPV4=""            # space/comma/newline separated CIDRs, optional
+EXTRA_ALLOWLIST_IPV6=""            # space/comma/newline separated CIDRs, optional
+MENU_DEFAULT_DOMAIN=""
+MENU_DEFAULT_ORIGIN_IP=""
+
+SET4="cfog_cf4"
+SET6="cfog_cf6"
+EXTRA4="cfog_extra4"
+EXTRA6="cfog_extra6"
+CHAIN4="CFOG_WEB_FILTER"
+CHAIN6="CFOG_WEB_FILTER"
+
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+  fi
+  WEB_PORTS="${WEB_PORTS//[[:space:]]/}"
+}
+
+load_config
+
+usage() {
+  cat <<USAGE
+${PROGRAM} ${VERSION}
+
+Usage:
+  cf                         Open the visual switch panel
+  cf status                  Show current status
+  cf apply | cf sync         Download Cloudflare IPs and apply configured protection
+  cf remove                  Remove firewall rules and ipsets created by this tool
+  cf realip                  Regenerate Nginx real_ip config when MANAGE_NGINX_REALIP=1
+  cf realip-off              Remove generated Nginx real_ip config
+  cf verify DOMAIN [ORIGIN_IP]
+                             Verify normal Cloudflare access and optional direct-origin block test
+  cf menu                    Open the visual switch panel
+  cf help                    Show this help
+
+Advanced command name:
+  cf-origin-guard <command>
+
+Config:
+  ${CONFIG_FILE}
+USAGE
+}
+
+mkdir_for_log() {
+  local dir
+  dir="$(dirname "$LOG_FILE")"
+  [[ -d "$dir" ]] || mkdir -p "$dir" 2>/dev/null || true
+}
+
+log() {
+  local msg
+  msg="[$(date '+%F %T%z')] $*"
+  echo "$msg" >&2
+  mkdir_for_log
+  printf '%s\n' "$msg" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+warn() {
+  log "WARN: $*"
+}
+
+die() {
+  log "ERROR: $*"
+  exit 1
+}
+
+need_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    die "must run as root. Try: sudo cf"
+  fi
+}
+
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+cmd_path() {
+  command -v "$1" 2>/dev/null || true
+}
+
+normalize_bool() {
+  local value="${1:-0}"
+  case "$value" in
+    1|yes|true|on|enabled) printf '1\n' ;;
+    *) printf '0\n' ;;
+  esac
+}
+
+validate_config() {
+  [[ "$WEB_PORTS" =~ ^[0-9]+(,[0-9]+)*$ ]] || die "WEB_PORTS must be comma-separated TCP ports, e.g. 80,443"
+  case "$ENABLE_GUARD" in 0|1) ;; *) die "ENABLE_GUARD must be 0 or 1" ;; esac
+  case "$ENABLE_AUTO_SYNC" in 0|1) ;; *) die "ENABLE_AUTO_SYNC must be 0 or 1" ;; esac
+  case "$ENABLE_IPV6" in auto|0|1) ;; *) die "ENABLE_IPV6 must be auto, 0, or 1" ;; esac
+  case "$DROP_ACTION" in DROP|REJECT) ;; *) die "DROP_ACTION must be DROP or REJECT" ;; esac
+  case "$ALLOW_LOOPBACK" in 0|1) ;; *) die "ALLOW_LOOPBACK must be 0 or 1" ;; esac
+  case "$MANAGE_NGINX_REALIP" in 0|1) ;; *) die "MANAGE_NGINX_REALIP must be 0 or 1" ;; esac
+  case "$NGINX_REALIP_STRICT" in 0|1) ;; *) die "NGINX_REALIP_STRICT must be 0 or 1" ;; esac
+}
+
+require_firewall_commands() {
+  have_cmd curl || die "curl is required"
+  have_cmd ipset || die "ipset is required"
+  have_cmd iptables || die "iptables is required"
+}
+
+require_download_commands() {
+  have_cmd curl || die "curl is required"
+}
+
+write_config_template() {
+  mkdir -p "$CONFIG_DIR"
+  cat > "$CONFIG_FILE" <<EOF_CONF
+# cf-origin-guard configuration
+# This file is shell syntax. Keep values quoted.
+
+# Master switch. 1 = restrict protected web ports to Cloudflare IP ranges; 0 = disabled.
+ENABLE_GUARD="${ENABLE_GUARD}"
+
+# Daily automatic Cloudflare IP synchronization through systemd timer or cron.
+ENABLE_AUTO_SYNC="${ENABLE_AUTO_SYNC}"
+
+# Only these TCP ports will be restricted to Cloudflare source IP ranges.
+# Do not put SSH or aaPanel management ports here unless they are also behind Cloudflare.
+WEB_PORTS="${WEB_PORTS}"
+
+# auto: manage IPv6 when ip6tables is available; 1: require IPv6; 0: disable IPv6 firewall rules.
+ENABLE_IPV6="${ENABLE_IPV6}"
+
+# DROP is quieter and recommended for hiding direct-origin access.
+# REJECT is easier to test but reveals that the origin is reachable.
+DROP_ACTION="${DROP_ACTION}"
+
+# Allow local health checks such as curl http://127.0.0.1/.
+ALLOW_LOOPBACK="${ALLOW_LOOPBACK}"
+
+# Generate Nginx real_ip config so xiaov2board / Nginx logs see real visitor IPs.
+# Default is off to avoid changing existing Nginx behavior without confirmation.
+# For aaPanel, auto writes: /www/server/panel/vhost/nginx/cf-origin-guard-realip.conf
+# For generic Nginx, auto writes: /etc/nginx/conf.d/cf-origin-guard-realip.conf
+MANAGE_NGINX_REALIP="${MANAGE_NGINX_REALIP}"
+NGINX_REALIP_CONF="${NGINX_REALIP_CONF}"
+NGINX_REALIP_STRICT="${NGINX_REALIP_STRICT}"
+
+# Official Cloudflare text lists.
+CF_IPV4_URL="${CF_IPV4_URL}"
+CF_IPV6_URL="${CF_IPV6_URL}"
+
+# Download behavior.
+CURL_CONNECT_TIMEOUT="${CURL_CONNECT_TIMEOUT}"
+CURL_MAX_TIME="${CURL_MAX_TIME}"
+CURL_RETRIES="${CURL_RETRIES}"
+
+# Optional direct-origin allowlist. Use only when a trusted system must bypass Cloudflare.
+# Examples:
+# EXTRA_ALLOWLIST_IPV4="203.0.113.10/32 198.51.100.0/24"
+# EXTRA_ALLOWLIST_IPV6="2001:db8::10/128"
+EXTRA_ALLOWLIST_IPV4="${EXTRA_ALLOWLIST_IPV4}"
+EXTRA_ALLOWLIST_IPV6="${EXTRA_ALLOWLIST_IPV6}"
+
+# Optional defaults used by the visual panel verification screen.
+MENU_DEFAULT_DOMAIN="${MENU_DEFAULT_DOMAIN}"
+MENU_DEFAULT_ORIGIN_IP="${MENU_DEFAULT_ORIGIN_IP}"
+
+LOG_FILE="${LOG_FILE}"
+EOF_CONF
+  chmod 0644 "$CONFIG_FILE"
+}
+
+ensure_config_file() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    write_config_template
+  fi
+}
+
+quote_config_value() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//\$/\\\$}"
+  value="${value//\`/\\\`}"
+  printf '"%s"' "$value"
+}
+
+set_config_value() {
+  local key="$1"
+  local value="$2"
+  local tmp quoted
+  ensure_config_file
+  mkdir -p "$CONFIG_DIR"
+  tmp="$(mktemp)"
+  quoted="$(quote_config_value "$value")"
+  {
+    grep -v -E "^[[:space:]]*${key}=" "$CONFIG_FILE" 2>/dev/null || true
+    printf '%s=%s\n' "$key" "$quoted"
+  } > "$tmp"
+  install -m 0644 "$tmp" "$CONFIG_FILE"
+  rm -f "$tmp"
+  load_config
+}
+
+can_use_ipv6() {
+  [[ "$ENABLE_IPV6" == "0" ]] && return 1
+
+  if ! have_cmd ip6tables; then
+    if [[ "$ENABLE_IPV6" == "1" ]]; then
+      die "ENABLE_IPV6=1 but ip6tables is unavailable"
+    fi
+    warn "IPv6 skipped: ip6tables is unavailable"
+    return 1
+  fi
+
+  if ! ip6tables -L -n >/dev/null 2>&1; then
+    if [[ "$ENABLE_IPV6" == "1" ]]; then
+      die "ENABLE_IPV6=1 but ip6tables cannot list rules"
+    fi
+    warn "IPv6 skipped: ip6tables cannot list rules"
+    return 1
+  fi
+
+  return 0
+}
+
+should_download_ipv6() {
+  [[ "$ENABLE_IPV6" != "0" || "$MANAGE_NGINX_REALIP" == "1" ]]
+}
+
+cleanup_dir=""
+cleanup() {
+  if [[ -n "$cleanup_dir" && -d "$cleanup_dir" ]]; then
+    rm -rf "$cleanup_dir"
+  fi
+}
+trap cleanup EXIT
+
+download_lists() {
+  cleanup_dir="$(mktemp -d)"
+  local v4_raw v6_raw v4_clean v6_clean
+  v4_raw="$cleanup_dir/ips-v4.raw"
+  v6_raw="$cleanup_dir/ips-v6.raw"
+  v4_clean="$cleanup_dir/ips-v4"
+  v6_clean="$cleanup_dir/ips-v6"
+
+  log "downloading Cloudflare IPv4 ranges from ${CF_IPV4_URL}"
+  curl -fsS \
+    --retry "$CURL_RETRIES" \
+    --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+    --max-time "$CURL_MAX_TIME" \
+    "$CF_IPV4_URL" -o "$v4_raw"
+
+  sed -e 's/\r$//' -e '/^[[:space:]]*$/d' -e '/^[[:space:]]*#/d' "$v4_raw" > "$v4_clean"
+  [[ -s "$v4_clean" ]] || die "downloaded IPv4 list is empty"
+
+  if should_download_ipv6; then
+    log "downloading Cloudflare IPv6 ranges from ${CF_IPV6_URL}"
+    curl -fsS \
+      --retry "$CURL_RETRIES" \
+      --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+      --max-time "$CURL_MAX_TIME" \
+      "$CF_IPV6_URL" -o "$v6_raw"
+    sed -e 's/\r$//' -e '/^[[:space:]]*$/d' -e '/^[[:space:]]*#/d' "$v6_raw" > "$v6_clean"
+    [[ -s "$v6_clean" ]] || die "downloaded IPv6 list is empty"
+  fi
+
+  printf '%s\n' "$v4_clean"
+  if [[ -s "$v6_clean" ]]; then
+    printf '%s\n' "$v6_clean"
+  fi
+}
+
+ipset_count() {
+  local set_name="$1"
+  if ! have_cmd ipset; then
+    printf '0\n'
+    return 0
+  fi
+  ipset list "$set_name" 2>/dev/null | awk -F': ' '/Number of entries/ {print $2; found=1} END {if (!found) print "0"}'
+}
+
+update_ipset_from_file() {
+  local set_name="$1"
+  local family="$2"
+  local list_file="$3"
+  local tmp_set count net
+
+  tmp_set="${set_name}_t_$$"
+  ipset create "$set_name" hash:net family "$family" -exist
+  ipset create "$tmp_set" hash:net family "$family" -exist
+  ipset flush "$tmp_set"
+
+  while IFS= read -r net; do
+    [[ -n "$net" ]] || continue
+    ipset add "$tmp_set" "$net" -exist
+  done < "$list_file"
+
+  count="$(ipset_count "$tmp_set")"
+  [[ "$count" =~ ^[0-9]+$ ]] || count="0"
+  (( count > 0 )) || die "ipset ${tmp_set} has no entries; refusing to replace ${set_name}"
+
+  ipset swap "$tmp_set" "$set_name"
+  ipset destroy "$tmp_set" >/dev/null 2>&1 || true
+  log "updated ipset ${set_name}: ${count} entries"
+}
+
+normalize_allowlist() {
+  local data="$1"
+  printf '%s\n' "$data" | tr ',;' '\n\n' | tr ' ' '\n' | sed -e 's/\r$//' -e '/^[[:space:]]*$/d' -e '/^[[:space:]]*#/d'
+}
+
+update_extra_ipset() {
+  local set_name="$1"
+  local family="$2"
+  local entries="$3"
+  local tmp_set count net
+
+  tmp_set="${set_name}_t_$$"
+  ipset create "$set_name" hash:net family "$family" -exist
+  ipset create "$tmp_set" hash:net family "$family" -exist
+  ipset flush "$tmp_set"
+
+  while IFS= read -r net; do
+    [[ -n "$net" ]] || continue
+    ipset add "$tmp_set" "$net" -exist
+  done < <(normalize_allowlist "$entries")
+
+  ipset swap "$tmp_set" "$set_name"
+  ipset destroy "$tmp_set" >/dev/null 2>&1 || true
+  count="$(ipset_count "$set_name")"
+  log "updated optional allowlist ${set_name}: ${count} entries"
+}
+
+remove_input_jumps_to_chain() {
+  local ipt="$1"
+  local chain="$2"
+  local line
+
+  while true; do
+    line="$($ipt -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$chain" '$2 == c {print $1; exit}')"
+    [[ -n "$line" ]] || break
+    "$ipt" -D INPUT "$line" >/dev/null 2>&1 || break
+  done
+}
+
+install_one_family_rules() {
+  local ipt="$1"
+  local chain="$2"
+  local cf_set="$3"
+  local extra_set="$4"
+  local family_label="$5"
+
+  "$ipt" -N "$chain" >/dev/null 2>&1 || true
+  "$ipt" -F "$chain"
+
+  if [[ "$ALLOW_LOOPBACK" == "1" ]]; then
+    "$ipt" -A "$chain" -i lo -j ACCEPT
+  fi
+
+  "$ipt" -A "$chain" -m set --match-set "$cf_set" src -j ACCEPT
+  "$ipt" -A "$chain" -m set --match-set "$extra_set" src -j ACCEPT
+
+  if [[ "$DROP_ACTION" == "REJECT" ]]; then
+    "$ipt" -A "$chain" -p tcp -j REJECT
+  else
+    "$ipt" -A "$chain" -j DROP
+  fi
+
+  remove_input_jumps_to_chain "$ipt" "$chain"
+  "$ipt" -I INPUT 1 -p tcp -m multiport --dports "$WEB_PORTS" -j "$chain"
+  log "installed ${family_label} firewall chain ${chain} for TCP ports ${WEB_PORTS}"
+}
+
+install_firewall_rules() {
+  install_one_family_rules iptables "$CHAIN4" "$SET4" "$EXTRA4" "IPv4"
+
+  if can_use_ipv6; then
+    install_one_family_rules ip6tables "$CHAIN6" "$SET6" "$EXTRA6" "IPv6"
+  fi
+}
+
+remove_one_family_rules() {
+  local ipt="$1"
+  local chain="$2"
+  local family_label="$3"
+
+  if ! have_cmd "$ipt" || ! "$ipt" -L -n >/dev/null 2>&1; then
+    warn "${family_label}: ${ipt} not available or cannot list rules"
+    return 0
+  fi
+
+  remove_input_jumps_to_chain "$ipt" "$chain"
+  "$ipt" -F "$chain" >/dev/null 2>&1 || true
+  "$ipt" -X "$chain" >/dev/null 2>&1 || true
+  log "removed ${family_label} firewall chain ${chain}"
+}
+
+remove_firewall_rules() {
+  need_root
+  remove_one_family_rules iptables "$CHAIN4" "IPv4"
+  if have_cmd ip6tables; then
+    remove_one_family_rules ip6tables "$CHAIN6" "IPv6"
+  fi
+
+  if have_cmd ipset; then
+    for set_name in "$SET4" "$SET6" "$EXTRA4" "$EXTRA6"; do
+      ipset destroy "$set_name" >/dev/null 2>&1 || true
+    done
+    log "destroyed ipsets created by ${PROGRAM} where possible"
+  fi
+}
+
+detect_realip_path() {
+  if [[ "$NGINX_REALIP_CONF" != "auto" ]]; then
+    printf '%s\n' "$NGINX_REALIP_CONF"
+    return 0
+  fi
+
+  if [[ -d "/www/server/panel/vhost/nginx" ]]; then
+    printf '%s\n' "/www/server/panel/vhost/nginx/cf-origin-guard-realip.conf"
+    return 0
+  fi
+
+  if [[ -d "/etc/nginx/conf.d" ]]; then
+    printf '%s\n' "/etc/nginx/conf.d/cf-origin-guard-realip.conf"
+    return 0
+  fi
+
+  printf '%s\n' ""
+}
+
+detect_nginx_bin() {
+  if [[ -x "/www/server/nginx/sbin/nginx" ]]; then
+    printf '%s\n' "/www/server/nginx/sbin/nginx"
+    return 0
+  fi
+
+  if have_cmd nginx; then
+    cmd_path nginx
+    return 0
+  fi
+
+  printf '%s\n' ""
+}
+
+reload_nginx_safely() {
+  local nginx_bin="$1"
+
+  [[ -n "$nginx_bin" ]] || return 1
+
+  if ! "$nginx_bin" -t >/tmp/cf-origin-guard-nginx-test.log 2>&1; then
+    cat /tmp/cf-origin-guard-nginx-test.log >&2 || true
+    return 1
+  fi
+
+  if [[ -x "/etc/init.d/nginx" ]]; then
+    /etc/init.d/nginx reload >/tmp/cf-origin-guard-nginx-reload.log 2>&1 && return 0
+    cat /tmp/cf-origin-guard-nginx-reload.log >&2 || true
+  fi
+
+  if have_cmd systemctl && systemctl list-unit-files nginx.service >/dev/null 2>&1; then
+    systemctl reload nginx >/tmp/cf-origin-guard-nginx-reload.log 2>&1 && return 0
+    cat /tmp/cf-origin-guard-nginx-reload.log >&2 || true
+  fi
+
+  "$nginx_bin" -s reload >/tmp/cf-origin-guard-nginx-reload.log 2>&1 && return 0
+  cat /tmp/cf-origin-guard-nginx-reload.log >&2 || true
+  return 1
+}
+
+update_nginx_realip() {
+  local v4_file="$1"
+  local v6_file="${2:-}"
+  local realip_path realip_dir tmp_file backup nginx_bin cidr
+
+  [[ "$MANAGE_NGINX_REALIP" == "1" ]] || return 0
+
+  realip_path="$(detect_realip_path)"
+  if [[ -z "$realip_path" ]]; then
+    warn "Nginx real_ip skipped: no aaPanel or /etc/nginx/conf.d directory detected"
+    return 0
+  fi
+
+  realip_dir="$(dirname "$realip_path")"
+  mkdir -p "$realip_dir"
+  tmp_file="$(mktemp)"
+
+  {
+    echo "# Generated by cf-origin-guard. Do not edit manually."
+    echo "# Source: https://www.cloudflare.com/ips/"
+    echo ""
+    echo "# Cloudflare IPv4"
+    while IFS= read -r cidr; do
+      [[ -n "$cidr" ]] && printf 'set_real_ip_from %s;\n' "$cidr"
+    done < "$v4_file"
+
+    if [[ -n "$v6_file" && -s "$v6_file" ]]; then
+      echo ""
+      echo "# Cloudflare IPv6"
+      while IFS= read -r cidr; do
+        [[ -n "$cidr" ]] && printf 'set_real_ip_from %s;\n' "$cidr"
+      done < "$v6_file"
+    fi
+
+    echo ""
+    echo "real_ip_header CF-Connecting-IP;"
+    echo "real_ip_recursive on;"
+  } > "$tmp_file"
+
+  backup=""
+  if [[ -f "$realip_path" ]]; then
+    backup="${realip_path}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a "$realip_path" "$backup"
+  fi
+
+  install -m 0644 "$tmp_file" "$realip_path"
+  rm -f "$tmp_file"
+  log "wrote Nginx real_ip config: ${realip_path}"
+
+  nginx_bin="$(detect_nginx_bin)"
+  if [[ -z "$nginx_bin" ]]; then
+    warn "Nginx binary not found; real_ip config was written but not tested/reloaded"
+    return 0
+  fi
+
+  if reload_nginx_safely "$nginx_bin"; then
+    log "Nginx config test passed and Nginx was reloaded"
+    return 0
+  fi
+
+  warn "Nginx test/reload failed after writing real_ip config; restoring previous state"
+  if [[ -n "$backup" && -f "$backup" ]]; then
+    cp -a "$backup" "$realip_path"
+  else
+    rm -f "$realip_path"
+  fi
+
+  if reload_nginx_safely "$nginx_bin"; then
+    warn "previous Nginx state restored"
+  else
+    warn "could not reload Nginx after restore; inspect Nginx manually"
+  fi
+
+  if [[ "$NGINX_REALIP_STRICT" == "1" ]]; then
+    die "Nginx real_ip update failed"
+  fi
+
+  return 0
+}
+
+realip_candidate_paths() {
+  if [[ "$NGINX_REALIP_CONF" != "auto" ]]; then
+    printf '%s\n' "$NGINX_REALIP_CONF"
+    return 0
+  fi
+  printf '%s\n' "/www/server/panel/vhost/nginx/cf-origin-guard-realip.conf"
+  printf '%s\n' "/etc/nginx/conf.d/cf-origin-guard-realip.conf"
+}
+
+remove_nginx_realip() {
+  need_root
+  local nginx_bin path backup removed=0 restored=0
+  nginx_bin="$(detect_nginx_bin)"
+
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    [[ -f "$path" ]] || continue
+    backup="${path}.removed.$(date +%Y%m%d%H%M%S)"
+    cp -a "$path" "$backup"
+    rm -f "$path"
+    log "removed generated Nginx real_ip config: ${path}"
+    removed=1
+
+    if [[ -n "$nginx_bin" ]]; then
+      if ! reload_nginx_safely "$nginx_bin"; then
+        warn "Nginx reload failed after removing ${path}; restoring file"
+        cp -a "$backup" "$path"
+        reload_nginx_safely "$nginx_bin" || true
+        restored=1
+      fi
+    fi
+  done < <(realip_candidate_paths)
+
+  if [[ "$removed" -eq 0 ]]; then
+    log "no generated Nginx real_ip config found"
+  elif [[ "$restored" -eq 0 ]]; then
+    log "Nginx real_ip config removal completed"
+  fi
+}
+
+apply_all() {
+  need_root
+  ensure_config_file
+  load_config
+  validate_config
+
+  if [[ "$ENABLE_GUARD" != "1" ]]; then
+    log "source guard is disabled by config; removing firewall rules if present"
+    remove_firewall_rules
+    if [[ "$MANAGE_NGINX_REALIP" == "1" ]]; then
+      realip_only
+    fi
+    return 0
+  fi
+
+  require_firewall_commands
+
+  local list_files v4_file v6_file
+  mapfile -t list_files < <(download_lists)
+  v4_file="${list_files[0]:-}"
+  v6_file="${list_files[1]:-}"
+  [[ -n "$v4_file" && -s "$v4_file" ]] || die "IPv4 list path is empty"
+
+  update_ipset_from_file "$SET4" "inet" "$v4_file"
+  update_extra_ipset "$EXTRA4" "inet" "$EXTRA_ALLOWLIST_IPV4"
+
+  if can_use_ipv6; then
+    if [[ -n "$v6_file" && -s "$v6_file" ]]; then
+      update_ipset_from_file "$SET6" "inet6" "$v6_file"
+      update_extra_ipset "$EXTRA6" "inet6" "$EXTRA_ALLOWLIST_IPV6"
+    else
+      warn "IPv6 firewall requested/available but IPv6 Cloudflare list was not downloaded"
+    fi
+  fi
+
+  install_firewall_rules
+  update_nginx_realip "$v4_file" "$v6_file"
+  log "apply completed"
+}
+
+realip_only() {
+  need_root
+  ensure_config_file
+  load_config
+  validate_config
+  require_download_commands
+
+  if [[ "$MANAGE_NGINX_REALIP" != "1" ]]; then
+    warn "Nginx real_ip switch is disabled. Enable it in 'cf' panel or set MANAGE_NGINX_REALIP=1."
+    return 0
+  fi
+
+  local list_files v4_file v6_file
+  mapfile -t list_files < <(download_lists)
+  v4_file="${list_files[0]:-}"
+  v6_file="${list_files[1]:-}"
+  [[ -n "$v4_file" && -s "$v4_file" ]] || die "IPv4 list path is empty"
+  update_nginx_realip "$v4_file" "$v6_file"
+}
+
+print_rules_for_family() {
+  local ipt="$1"
+  local chain="$2"
+  local label="$3"
+
+  echo ""
+  echo "${label} INPUT jump(s):"
+  if have_cmd "$ipt" && "$ipt" -L INPUT -n --line-numbers >/dev/null 2>&1; then
+    "$ipt" -L INPUT -n --line-numbers | awk -v c="$chain" 'NR==1 || $2 == c {print}'
+  else
+    echo "  unavailable"
+  fi
+
+  echo ""
+  echo "${label} ${chain}:"
+  if have_cmd "$ipt" && "$ipt" -L "$chain" -n -v >/dev/null 2>&1; then
+    "$ipt" -L "$chain" -n -v
+  else
+    echo "  chain not found"
+  fi
+}
+
+guard_active() {
+  have_cmd iptables || return 1
+  iptables -S INPUT 2>/dev/null | grep -q -- "-j ${CHAIN4}"
+}
+
+ip6_guard_active() {
+  have_cmd ip6tables || return 1
+  ip6tables -S INPUT 2>/dev/null | grep -q -- "-j ${CHAIN6}"
+}
+
+timer_active() {
+  if have_cmd systemctl && systemctl list-unit-files cf-origin-guard.timer >/dev/null 2>&1; then
+    systemctl is-enabled cf-origin-guard.timer >/dev/null 2>&1 && return 0
+  fi
+  [[ -f /etc/cron.d/cf-origin-guard ]] && return 0
+  return 1
+}
+
+realip_file_present() {
+  local path
+  while IFS= read -r path; do
+    [[ -n "$path" && -f "$path" ]] && return 0
+  done < <(realip_candidate_paths)
+  return 1
+}
+
+status() {
+  ensure_config_file
+  load_config
+  validate_config
+
+  echo "${PROGRAM} ${VERSION}"
+  echo "Config file: ${CONFIG_FILE}"
+  echo "Source guard switch: ${ENABLE_GUARD}"
+  if guard_active; then
+    echo "Firewall active: yes"
+  else
+    echo "Firewall active: no"
+  fi
+  echo "Web TCP ports: ${WEB_PORTS}"
+  echo "IPv6 mode: ${ENABLE_IPV6}"
+  if ip6_guard_active; then
+    echo "IPv6 firewall active: yes"
+  else
+    echo "IPv6 firewall active: no"
+  fi
+  echo "Drop action: ${DROP_ACTION}"
+  echo "Nginx real_ip switch: ${MANAGE_NGINX_REALIP}"
+  echo "Nginx real_ip config path: $(detect_realip_path)"
+  if realip_file_present; then
+    echo "Nginx real_ip file present: yes"
+  else
+    echo "Nginx real_ip file present: no"
+  fi
+  if timer_active; then
+    echo "Auto sync timer/cron: enabled"
+  else
+    echo "Auto sync timer/cron: disabled"
+  fi
+  echo ""
+
+  echo "ipset counts:"
+  for set_name in "$SET4" "$SET6" "$EXTRA4" "$EXTRA6"; do
+    if have_cmd ipset && ipset list "$set_name" >/dev/null 2>&1; then
+      printf '  %-12s %s\n' "$set_name" "$(ipset_count "$set_name")"
+    else
+      printf '  %-12s %s\n' "$set_name" "not found"
+    fi
+  done
+
+  print_rules_for_family iptables "$CHAIN4" "IPv4"
+  if have_cmd ip6tables; then
+    print_rules_for_family ip6tables "$CHAIN6" "IPv6"
+  fi
+
+  if have_cmd systemctl; then
+    echo ""
+    echo "systemd timer:"
+    systemctl list-timers cf-origin-guard.timer --no-pager 2>/dev/null || true
+  fi
+}
+
+verify() {
+  local domain="${1:-}"
+  local origin_ip="${2:-}"
+
+  [[ -n "$domain" ]] || die "verify requires DOMAIN"
+  have_cmd curl || die "curl is required"
+
+  echo "Normal HTTPS request through DNS/Cloudflare:"
+  curl -k -I --connect-timeout 10 --max-time 20 "https://${domain}/" || true
+
+  if [[ -n "$origin_ip" ]]; then
+    echo ""
+    echo "Direct-origin HTTPS request using --resolve. Expected after protection is enabled: timeout, connection reset, or no HTTP response."
+    curl -k -I --connect-timeout 10 --max-time 20 \
+      --resolve "${domain}:443:${origin_ip}" \
+      "https://${domain}/" || true
+  fi
+}
+
+install_autosync() {
+  need_root
+  set_config_value ENABLE_AUTO_SYNC "1"
+
+  if have_cmd systemctl && [[ -f /etc/systemd/system/cf-origin-guard.timer ]]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable --now cf-origin-guard.timer >/dev/null 2>&1 || true
+    log "auto sync enabled through systemd timer"
+    return 0
+  fi
+
+  cat > /etc/cron.d/cf-origin-guard <<'EOF_CRON'
+# Update Cloudflare IP ranges and refresh origin firewall daily.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+17 4 * * * root /usr/local/sbin/cf-origin-guard apply >/dev/null 2>&1
+EOF_CRON
+  chmod 0644 /etc/cron.d/cf-origin-guard
+  log "auto sync enabled through cron fallback: /etc/cron.d/cf-origin-guard"
+}
+
+disable_autosync() {
+  need_root
+  set_config_value ENABLE_AUTO_SYNC "0"
+
+  if have_cmd systemctl; then
+    systemctl disable --now cf-origin-guard.timer >/dev/null 2>&1 || true
+  fi
+  rm -f /etc/cron.d/cf-origin-guard
+  log "auto sync disabled"
+}
+
+terminal_supports_color() {
+  [[ -t 1 ]] && have_cmd tput && [[ -n "${TERM:-}" ]] && [[ "${TERM:-}" != "dumb" ]]
+}
+
+init_colors() {
+  if terminal_supports_color; then
+    BOLD="$(tput bold 2>/dev/null || true)"
+    DIM="$(tput dim 2>/dev/null || true)"
+    RED="$(tput setaf 1 2>/dev/null || true)"
+    GREEN="$(tput setaf 2 2>/dev/null || true)"
+    YELLOW="$(tput setaf 3 2>/dev/null || true)"
+    BLUE="$(tput setaf 4 2>/dev/null || true)"
+    RESET="$(tput sgr0 2>/dev/null || true)"
+  else
+    BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; BLUE=""; RESET=""
+  fi
+}
+
+switch_text() {
+  local value="$1"
+  if [[ "$value" == "1" ]]; then
+    printf '%s已开启%s' "$GREEN" "$RESET"
+  else
+    printf '%s已关闭%s' "$RED" "$RESET"
+  fi
+}
+
+active_text() {
+  if "$@"; then
+    printf '%s生效中%s' "$GREEN" "$RESET"
+  else
+    printf '%s未生效%s' "$YELLOW" "$RESET"
+  fi
+}
+
+pause_menu() {
+  echo ""
+  read -r -p "按 Enter 返回面板... " _ || true
+}
+
+ask_confirm() {
+  local msg="$1"
+  local ans
+  read -r -p "${msg} [y/N]: " ans || return 1
+  case "$ans" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+redraw_menu() {
+  clear 2>/dev/null || true
+  load_config
+  local guard_switch realip_switch sync_switch firewall_state timer_state realip_state ip6_state
+  guard_switch="$(switch_text "$ENABLE_GUARD")"
+  realip_switch="$(switch_text "$MANAGE_NGINX_REALIP")"
+  if timer_active; then sync_switch="${GREEN}已开启${RESET}"; else sync_switch="${RED}已关闭${RESET}"; fi
+  firewall_state="$(active_text guard_active)"
+  ip6_state="$(active_text ip6_guard_active)"
+  if realip_file_present; then realip_state="${GREEN}文件存在${RESET}"; else realip_state="${YELLOW}未生成${RESET}"; fi
+
+  cat <<MENU
+${BOLD}Cloudflare Origin Guard 可视化面板${RESET}  v${VERSION}
+配置文件: ${CONFIG_FILE}
+
+  1) 源站保护开关          ${guard_switch}    实际防火墙: ${firewall_state}
+  2) 自动同步 CF IP         ${sync_switch}    每天同步 Cloudflare 官方 IP 段
+  3) Nginx 真实 IP          ${realip_switch}    real_ip: ${realip_state}
+  4) IPv6 防护模式          ${BLUE}${ENABLE_IPV6}${RESET}        IPv6 防火墙: ${ip6_state}
+  5) 保护端口               ${BLUE}${WEB_PORTS}${RESET}
+  6) 拦截方式               ${BLUE}${DROP_ACTION}${RESET}
+  7) 额外白名单             IPv4/IPv6 直连白名单
+  8) 立即同步并应用         下载 CF IP + 刷新规则
+  9) 查看详细状态           iptables / ipset / timer
+ 10) 验证站点               域名访问 + 源站直连测试
+ 11) 删除防火墙规则          关闭保护并恢复 80/443 直连
+ 12) 打开配置文件路径        显示配置位置和常用命令
+
+  0) 退出
+
+${DIM}提示: 默认不会改 SSH、aaPanel 管理端口；只限制 WEB_PORTS 中的端口。${RESET}
+MENU
+}
+
+action_toggle_guard() {
+  if [[ "$ENABLE_GUARD" == "1" ]]; then
+    if ask_confirm "关闭源站保护并删除当前防火墙规则？"; then
+      set_config_value ENABLE_GUARD "0"
+      remove_firewall_rules
+    fi
+    pause_menu
+    return 0
+  fi
+
+  cat <<WARN_TXT
+
+即将开启源站保护：
+- ${WEB_PORTS} 端口只允许 Cloudflare IP 和额外白名单访问。
+- 灰云域名、源站 IP 直连、未走 Cloudflare 的回调/监控会被拦截。
+- SSH 和 aaPanel 管理端口不会被修改，除非你把它们写进 WEB_PORTS。
+WARN_TXT
+  if ask_confirm "确认开启？"; then
+    set_config_value ENABLE_GUARD "1"
+    apply_all
+  fi
+  pause_menu
+}
+
+action_toggle_sync() {
+  if timer_active; then
+    if ask_confirm "关闭自动同步 Cloudflare IP？"; then
+      disable_autosync
+    fi
+  else
+    install_autosync
+  fi
+  pause_menu
+}
+
+action_toggle_realip() {
+  if [[ "$MANAGE_NGINX_REALIP" == "1" ]]; then
+    if ask_confirm "关闭 Nginx real_ip 并删除生成的 real_ip 配置？"; then
+      set_config_value MANAGE_NGINX_REALIP "0"
+      remove_nginx_realip
+    fi
+    pause_menu
+    return 0
+  fi
+
+  cat <<REALIP_TXT
+
+即将开启 Nginx real_ip：
+- 会生成 cf-origin-guard-realip.conf。
+- 会执行 nginx -t，通过后才 reload Nginx。
+- 如果测试失败，会自动回滚生成文件。
+- 开启后 Nginx 日志和 xiaov2board 看到的 remote_addr 可能变成真实访客 IP。
+REALIP_TXT
+  if ask_confirm "确认开启？"; then
+    set_config_value MANAGE_NGINX_REALIP "1"
+    realip_only
+  fi
+  pause_menu
+}
+
+action_ipv6_mode() {
+  echo ""
+  echo "当前 IPv6 模式: ${ENABLE_IPV6}"
+  echo "1) auto  有 ip6tables 就启用 IPv6 防护"
+  echo "2) 1     强制启用 IPv6 防护；不可用则报错"
+  echo "3) 0     关闭 IPv6 防护"
+  echo ""
+  local c new
+  read -r -p "选择 IPv6 模式 [1-3]: " c || true
+  case "$c" in
+    1) new="auto" ;;
+    2) new="1" ;;
+    3) new="0" ;;
+    *) echo "未修改"; pause_menu; return 0 ;;
+  esac
+  set_config_value ENABLE_IPV6 "$new"
+  if [[ "$ENABLE_GUARD" == "1" ]]; then
+    apply_all
+  fi
+  pause_menu
+}
+
+action_ports() {
+  echo ""
+  echo "当前保护端口: ${WEB_PORTS}"
+  echo "常用: 80,443"
+  echo "不要填写 SSH 或 aaPanel 管理端口，除非它们也通过 Cloudflare 代理。"
+  local ports
+  read -r -p "请输入新的 TCP 端口列表: " ports || true
+  ports="${ports//[[:space:]]/}"
+  if [[ ! "$ports" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+    echo "格式错误。示例: 80,443"
+    pause_menu
+    return 0
+  fi
+  set_config_value WEB_PORTS "$ports"
+  if [[ "$ENABLE_GUARD" == "1" ]]; then
+    apply_all
+  fi
+  pause_menu
+}
+
+action_drop() {
+  local new
+  if [[ "$DROP_ACTION" == "DROP" ]]; then
+    new="REJECT"
+  else
+    new="DROP"
+  fi
+  set_config_value DROP_ACTION "$new"
+  echo "拦截方式已切换为: ${new}"
+  if [[ "$ENABLE_GUARD" == "1" ]]; then
+    apply_all
+  fi
+  pause_menu
+}
+
+action_allowlist() {
+  echo ""
+  echo "当前 IPv4 额外白名单: ${EXTRA_ALLOWLIST_IPV4:-空}"
+  echo "当前 IPv6 额外白名单: ${EXTRA_ALLOWLIST_IPV6:-空}"
+  echo ""
+  echo "格式示例: 203.0.113.10/32 198.51.100.0/24"
+  echo "留空表示清空。"
+  local v4 v6
+  read -r -p "新的 IPv4 白名单: " v4 || true
+  read -r -p "新的 IPv6 白名单: " v6 || true
+  set_config_value EXTRA_ALLOWLIST_IPV4 "$v4"
+  set_config_value EXTRA_ALLOWLIST_IPV6 "$v6"
+  if [[ "$ENABLE_GUARD" == "1" ]]; then
+    apply_all
+  fi
+  pause_menu
+}
+
+action_apply_now() {
+  apply_all
+  pause_menu
+}
+
+action_status() {
+  status
+  pause_menu
+}
+
+action_verify() {
+  local domain origin_ip
+  echo ""
+  read -r -p "面板域名 [${MENU_DEFAULT_DOMAIN:-无默认}]: " domain || true
+  domain="${domain:-$MENU_DEFAULT_DOMAIN}"
+  if [[ -z "$domain" ]]; then
+    echo "未输入域名。"
+    pause_menu
+    return 0
+  fi
+  read -r -p "源站 IP，可留空 [${MENU_DEFAULT_ORIGIN_IP:-无默认}]: " origin_ip || true
+  origin_ip="${origin_ip:-$MENU_DEFAULT_ORIGIN_IP}"
+  set_config_value MENU_DEFAULT_DOMAIN "$domain"
+  set_config_value MENU_DEFAULT_ORIGIN_IP "$origin_ip"
+  verify "$domain" "$origin_ip"
+  pause_menu
+}
+
+action_remove_rules() {
+  if ask_confirm "确认删除 cf-origin-guard 防火墙规则并关闭源站保护？"; then
+    set_config_value ENABLE_GUARD "0"
+    remove_firewall_rules
+  fi
+  pause_menu
+}
+
+action_config_info() {
+  cat <<INFO
+
+配置文件：
+  ${CONFIG_FILE}
+
+常用命令：
+  cf                  打开可视化面板
+  cf status           查看状态
+  cf apply            同步 Cloudflare IP 并按配置应用
+  cf remove           删除本工具创建的防火墙规则
+  cf realip           重新生成 Nginx real_ip 配置
+  cf realip-off       删除生成的 Nginx real_ip 配置
+  cf verify 域名 源站IP
+
+日志：
+  ${LOG_FILE}
+INFO
+  pause_menu
+}
+
+menu() {
+  need_root
+  ensure_config_file
+  validate_config
+  init_colors
+
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    echo "Visual panel requires an interactive terminal. Use: cf status / cf apply / cf remove"
+    exit 1
+  fi
+
+  local choice
+  while true; do
+    redraw_menu
+    read -r -p "请选择操作 [0-12]: " choice || true
+    case "$choice" in
+      1) action_toggle_guard ;;
+      2) action_toggle_sync ;;
+      3) action_toggle_realip ;;
+      4) action_ipv6_mode ;;
+      5) action_ports ;;
+      6) action_drop ;;
+      7) action_allowlist ;;
+      8) action_apply_now ;;
+      9) action_status ;;
+      10) action_verify ;;
+      11) action_remove_rules ;;
+      12) action_config_info ;;
+      0|q|Q|exit) clear 2>/dev/null || true; exit 0 ;;
+      *) echo "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
+main() {
+  local command="${1:-menu}"
+  case "$command" in
+    apply|sync)
+      apply_all
+      ;;
+    realip)
+      realip_only
+      ;;
+    realip-off)
+      set_config_value MANAGE_NGINX_REALIP "0"
+      remove_nginx_realip
+      ;;
+    status)
+      status
+      ;;
+    remove)
+      set_config_value ENABLE_GUARD "0"
+      remove_firewall_rules
+      ;;
+    verify)
+      shift
+      verify "$@"
+      ;;
+    menu|panel|ui)
+      menu
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    version|-v|--version)
+      echo "${PROGRAM} ${VERSION}"
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

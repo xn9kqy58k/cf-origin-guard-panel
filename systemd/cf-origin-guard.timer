@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily Cloudflare Origin Guard IP range sync
+
+[Timer]
+OnBootSec=5min
+OnCalendar=*-*-* 04:17:00
+RandomizedDelaySec=30min
+Persistent=true
+Unit=cf-origin-guard.service
+
+[Install]
+WantedBy=timers.target
